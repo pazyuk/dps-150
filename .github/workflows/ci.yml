@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test
+      - name: Build sandboxed app (as for the App Store, ad-hoc signed)
+        run: SANDBOX=1 ./build_app.sh
+      - name: Build app
+        run: ./build_app.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: DPS-150-Control
+          path: dist/
+          retention-days: 14

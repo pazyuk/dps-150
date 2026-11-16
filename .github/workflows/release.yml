@@ -1,0 +1,156 @@
+name: Release
+
+# Tag vX.Y.Z → GitHub Release + upload to App Store Connect.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+env:
+  APP: DPS-150 Control
+  BUNDLE_ID: ${{ vars.BUNDLE_ID || 'ge.dps150.control' }}
+  SWIFT_FLAGS: --arch arm64 --arch x86_64
+  BUILD: ${{ github.run_number }}
+  UPDATE_REPO: ${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: swift test
+
+      - name: Create signing keychain
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+      - name: Install App Store Connect API key
+        id: asc
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          [ -n "$ASC_KEY_P8" ] || exit 0
+          mkdir -p ~/.appstoreconnect/private_keys
+          KEY=~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          # the secret is the .p8 contents as is, or the same in base64
+          case "$ASC_KEY_P8" in
+            *"BEGIN PRIVATE KEY"*) echo "$ASC_KEY_P8" > "$KEY" ;;
+            *) echo "$ASC_KEY_P8" | base64 --decode > "$KEY" ;;
+          esac
+          openssl pkey -in "$KEY" -noout || { echo "::error::ASC_KEY_P8 is not a valid .p8 key ($(wc -l < "$KEY") lines, $(wc -c < "$KEY") bytes)"; exit 1; }
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      # ---- GitHub Release: Developer ID + notarization (otherwise ad-hoc) ----
+
+      - name: Import Developer ID certificate
+        id: devid
+        env:
+          P12: ${{ secrets.DEVID_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVID_CERT_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then
+            echo "::warning::DEVID_CERT_P12 is not set — the GitHub build is ad-hoc signed: no notarization, no in-app update install"
+            exit 0
+          fi
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/devid.p12"
+          security import "$RUNNER_TEMP/devid.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          rm "$RUNNER_TEMP/devid.p12"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build app for GitHub Release
+        env:
+          SIGN_ID: ${{ steps.devid.outputs.enabled == 'true' && 'Developer ID Application' || '-' }}
+        run: |
+          ./build_app.sh
+          ditto -c -k --keepParent "dist/$APP.app" "DPS-150-Control-$VERSION.zip"
+
+      - name: Notarize and staple
+        if: steps.devid.outputs.enabled == 'true' && steps.asc.outputs.enabled == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcrun notarytool submit "DPS-150-Control-$VERSION.zip" --wait \
+            --key ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+            --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
+          xcrun stapler staple "dist/$APP.app"
+          rm "DPS-150-Control-$VERSION.zip"
+          ditto -c -k --keepParent "dist/$APP.app" "DPS-150-Control-$VERSION.zip"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # a re-run after a later step failed: the release is already there, just replace the asset
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "DPS-150-Control-$VERSION.zip" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "DPS-150-Control-$VERSION.zip" --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+
+      # ---- App Store ------------------------------------------------------
+
+      - name: Check App Store secrets
+        id: appstore
+        env:
+          P12: ${{ secrets.APPSTORE_CERTS_P12 }}
+        run: |
+          if [ -n "$P12" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else echo "::warning::App Store secrets are not set — upload skipped"; fi
+
+      - name: Import certificates and profile
+        if: steps.appstore.outputs.enabled == 'true'
+        env:
+          P12: ${{ secrets.APPSTORE_CERTS_P12 }}
+          P12_PASSWORD: ${{ secrets.APPSTORE_CERTS_PASSWORD }}
+          PROFILE_B64: ${{ secrets.APPSTORE_PROFILE }}
+        run: |
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/certs.p12"
+          security import "$RUNNER_TEMP/certs.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          rm "$RUNNER_TEMP/certs.p12"
+          echo "$PROFILE_B64" | base64 --decode > "$RUNNER_TEMP/app.provisionprofile"
+
+      - name: Build, sign and package for the App Store
+        if: steps.appstore.outputs.enabled == 'true'
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          SANDBOX=1 SIGN_ID="Apple Distribution" PROFILE="$RUNNER_TEMP/app.provisionprofile" ./build_app.sh
+          codesign --verify --strict --verbose=2 "dist/$APP.app"
+          productbuild --component "dist/$APP.app" /Applications \
+            --sign "3rd Party Mac Developer Installer" "$RUNNER_TEMP/DPS150.pkg"
+
+      - name: Upload to App Store Connect
+        if: steps.appstore.outputs.enabled == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          xcrun altool --upload-app --type macos --file "$RUNNER_TEMP/DPS150.pkg" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Clean up secrets
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -rf ~/.appstoreconnect/private_keys "$RUNNER_TEMP/app.provisionprofile"
